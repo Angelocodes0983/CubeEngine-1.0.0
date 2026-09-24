@@ -1,0 +1,629 @@
+
+#version 450
+#extension GL_EXT_nonuniform_qualifier : enable
+
+
+//#define DEBUG_MIP_LEVELS  // comment this out to disable
+
+bool DEBUG_MIP_LEVELS = true;
+layout (local_size_x = 16, local_size_y = 16) in;
+
+layout (binding = 0, rgba8) uniform writeonly image2D img;
+layout (binding = 1) uniform usampler3D voxelTextures[];
+
+#define RESOLUTION_SCALE 2
+bool FLOORENABLED = false;
+bool LODENABLED = true;
+float LODDIS = 100;
+struct Material {
+    vec4  color;
+    float emissive;
+    float hardness;
+    float isTransparent;
+    float isLiquid;
+};
+
+struct VoxelObject {
+    mat4   transform;
+    mat4   invTransform;
+    vec3   boundsMin;       
+    float  mass;
+    vec3   boundsMax;      
+    float  restitution;
+    ivec4  gridSizeAndTex;  // xyz=gridSize, w=textureIndex
+    vec3   velocity;        
+    float  pad0;
+    vec3   angularVel;      
+    float  pad1;
+};
+struct BrickNode {
+	int occupancy;
+
+};
+layout(binding = 2, std430) readonly buffer BrickBuffer {
+    BrickNode nodes[];
+};
+layout(binding = 3, std430) readonly buffer MaterialBuffer {
+    Material materials[256];
+};
+
+layout(binding = 4, std430) readonly buffer VoxelObjectBuffer {
+    VoxelObject objects[];
+};
+layout(binding = 5, std430) readonly buffer BrickElementsBuffer {
+    int brickElements[];
+};
+
+layout(push_constant) uniform CameraData {
+    mat4  view;        // offset 0
+    mat4  projection;  // offset 64
+    vec3  cameraPos;   // offset 128
+    float padding1;    // offset 140
+    int   voxelCount;  // offset 144
+    float time;        // offset 148
+    float padding2[2]; // offset 152
+    vec3  worldMin;    // offset 160
+    float padding3;    // offset 172
+    vec3  worldMax;    // offset 176
+    float objectCount;    // offset 188
+    ivec3 gridSize;    // offset 192
+    float padding5;    // offset 204
+    mat4  invViewProj; // offset 208
+} camera;
+
+
+
+
+const int MAX_RAY_STEPS = 256*2;
+
+// -------------------------------------------------------
+// Helpers
+// -------------------------------------------------------
+
+vec4 paletteColor(uint matIndex) {
+    if (matIndex == 0u) return vec4(0.0);
+    return materials[matIndex].color;
+}
+
+bool rayAABB(vec3 ro, vec3 rd, vec3 mn, vec3 mx, out float tNear, out float tFar) {
+    vec3 invD = 1.0 / rd;
+    vec3 t0   = (mn - ro) * invD;
+    vec3 t1   = (mx - ro) * invD;
+    vec3 tmin = min(t0, t1);
+    vec3 tmax = max(t0, t1);
+
+    tNear = max(max(tmin.x, tmin.y), tmin.z);
+    tFar  = min(min(tmax.x, tmax.y), tmax.z);
+
+    return tFar >= max(tNear - 0.0001, 0.0);
+}
+
+uint GetIndexFromPos(ivec3 pos, ivec3 size) 
+{
+    pos /= 8;
+    size /= 8;
+
+    return (pos.z * size.x * size.y) + (pos.y * size.x) + pos.x;
+}
+
+
+float targetCalculationPositive(float x) {
+    return((floor(x/8)+1)*8);
+}
+float targetCalculationNegative(float x) {
+    return((floor(x/8))*8);
+}
+
+bool traceDDA_Local(
+    float maxDistance,
+    vec3       localRo,
+    vec3       localRd,
+    int        texIdx,
+    ivec3      gridSz,
+    out Material material,
+    out float  outLocalT,
+    out ivec3  normalMask)
+{
+    const float EPSILON = 1e-5;
+
+    float tNear, tFar;
+    if (!rayAABB(localRo, localRd, vec3(0.0) - EPSILON, vec3(gridSz) + EPSILON, tNear, tFar))
+        return false;
+
+    float tStart = (tNear < 0.0) ? EPSILON : tNear + EPSILON;
+    vec3 ro = localRo + localRd * tStart;
+
+    ivec3 mapPos = clamp(ivec3(floor(ro)), ivec3(0), gridSz - 1);
+    ivec3 rayStep  = ivec3(sign(localRd));
+
+    vec3 deltaDist = abs(1.0 / max(abs(localRd), vec3(EPSILON)));
+
+    vec3 sideDist;
+    for (int k = 0; k < 3; k++) {
+        if (localRd[k] > 0.0)
+            sideDist[k] = (float(mapPos[k] + 1) - ro[k]) / localRd[k];
+        else if (localRd[k] < 0.0)
+            sideDist[k] = (ro[k] - float(mapPos[k])) / -localRd[k];
+        else
+            sideDist[k] = 1e30;
+    }
+
+    vec3  accColor = vec3(0.0);
+    float accAlpha = 0.0;
+    float firstT   = tStart;
+    bool  gotFirst = false;
+    bvec3 mask = bvec3(false);
+
+    vec3 worldMin = vec3(targetCalculationNegative(ro.x),targetCalculationNegative(ro.y),targetCalculationNegative(ro.z));
+
+    vec3 brickSize = vec3(8);
+
+    uint mat;
+
+    ivec3 voxNormal;
+    for (int i = 0; i < maxDistance; i++) {
+
+        if (accAlpha >= 0.99) break;
+        if (any(lessThan(mapPos, vec3(0))) || any(greaterThanEqual(mapPos, gridSz)))
+            break;
+
+        // Sample mip 0 only no acceleration
+        uint matIndex = texelFetch(voxelTextures[nonuniformEXT(texIdx)],
+                                   mapPos, 0).r;
+            
+
+        mat = matIndex;
+        if (matIndex > 0u) {
+            vec4 color = paletteColor(matIndex);
+
+            if(mask.x) voxNormal = ivec3(1,0,0);
+            else if(mask.y) voxNormal = ivec3(0,1,0);       
+            else if(mask.z) voxNormal = ivec3(0,0,1);
+            else voxNormal = ivec3(0,0,0);
+
+            float shade = 1.0;
+   
+
+            if (!gotFirst) {
+                firstT = tStart + (
+                    mask.x ? sideDist.x - deltaDist.x:
+                    mask.y ? sideDist.y - deltaDist.y:
+                    mask.z ? sideDist.z - deltaDist.z: 0.0);
+                gotFirst = true;
+            }
+
+            float a = color.a * (1.0 - accAlpha);
+            accColor += color.rgb * shade * a;
+            accAlpha += a;
+        }
+
+        
+       
+        mask     = lessThanEqual(sideDist.xyz, min(sideDist.yzx, sideDist.zxy));
+        sideDist += vec3(mask) * deltaDist;
+        mapPos   += ivec3(vec3(mask)) * rayStep;
+    }
+
+    if (accAlpha > 0.004) {
+        material  =  materials[mat];
+        outLocalT = firstT;
+        normalMask = voxNormal;
+        return true;
+    }
+    return false;
+}
+
+bool traceBrick_Local(
+    vec3       localRo,
+    vec3       localRd,
+    int        texIdx,
+    ivec3      gridSz,
+    float      cameraDis,
+    out Material material,
+    out float  outLocalT,
+    out ivec3 brickNormals)
+{
+    const float EPSILON = 1e-5;
+
+    const int brickSize =8;
+
+    float tNear, tFar;
+    if (!rayAABB(localRo, localRd, vec3(0.0) - EPSILON, vec3(gridSz) + EPSILON, tNear, tFar))
+        return false;
+
+    float tStart = (tNear < 0.0) ? EPSILON : tNear + EPSILON;
+    vec3 ro = localRo + localRd * tStart;
+
+
+    ivec3 mapPos = clamp(ivec3(floor(ro)), ivec3(0), gridSz - 1);
+    ivec3 rayStep  = ivec3(sign(localRd));
+
+    vec3 deltaDist = abs(brickSize / max(abs(localRd), vec3(EPSILON)));
+
+    vec3 sideDist;
+    for (int k = 0; k < 3; k++) {
+        if (localRd[k] > 0.0)
+            sideDist[k] = (((targetCalculationPositive(mapPos[k])) - ro[k]) / localRd[k]);
+        else if (localRd[k] < 0.0)
+            sideDist[k] = ((ro[k] - (targetCalculationNegative(mapPos[k]))) / -localRd[k]);
+        else
+            sideDist[k] = 1e30;
+    }
+
+    vec3  accColor = vec3(0.0);
+    float accAlpha = 0.0;
+    float firstT   = tStart;
+    bool  gotFirst = false;
+    bvec3 mask = bvec3(false);
+
+    ivec3 finalNormal;
+    Material brickMaterial;
+
+    for (int i = 0; i < MAX_RAY_STEPS; i++) {
+
+        if (accAlpha >= 0.99) break;
+        if (any(lessThan(mapPos, ivec3(0))) || any(greaterThanEqual(mapPos, gridSz)))
+            break;
+
+        // Sample mip 0 only  no acceleration
+            
+        uint index = GetIndexFromPos(ivec3(targetCalculationNegative(mapPos.x), targetCalculationNegative(mapPos.y), targetCalculationNegative(mapPos.z)), gridSz);
+ 
+        
+        uint brickIndex = brickElements[texIdx] + index;
+
+        BrickNode node = nodes[brickIndex];
+
+        uint occupancy = node.occupancy;
+
+        if (occupancy == 500) {
+
+            vec3  hitColor;
+            float localT;
+
+            float brickEntryT =(i==0) ? tStart :(mask.x ? sideDist.x - deltaDist.x : mask.y ? sideDist.y - deltaDist.y : sideDist.z - deltaDist.z);
+            vec3 brickEntryPos = localRo + localRd * brickEntryT;
+            vec3 brickOrigin = vec3(
+                targetCalculationNegative(mapPos.x),
+                targetCalculationNegative(mapPos.y),
+                targetCalculationNegative(mapPos.z)
+            );
+
+            vec3 brickLocalRo = brickEntryPos - brickOrigin;
+
+            vec4 color;
+
+            float maxDis = distance(brickEntryPos, brickEntryPos + sideDist);
+
+            ivec3 normalMask;
+            Material voxMaterial;
+            if (traceDDA_Local(maxDis, brickEntryPos, localRd, texIdx, gridSz, voxMaterial, localT, normalMask) == true)
+            {
+                color = vec4(hitColor, 1);
+
+                if (!gotFirst) {
+                    firstT = brickEntryT + localT;
+                    gotFirst = true;
+                }
+
+            
+                float a = color.a * (1.0 - accAlpha);
+                accColor += color.rgb  * a;
+                accAlpha += a;
+            }
+
+            finalNormal = normalMask;
+            brickMaterial = voxMaterial;
+               
+        }   
+        else if (occupancy > 0) {
+            vec4 color = paletteColor(occupancy);
+
+            float shade = 1.0;
+
+            if (!gotFirst) {
+                firstT = tStart + (
+                    mask.x ? sideDist.x - deltaDist.x :
+                    mask.y ? sideDist.y - deltaDist.y :
+                    mask.z ? sideDist.z - deltaDist.z : 0.0);
+                gotFirst = true;
+            }
+
+            float a = color.a * (1.0 - accAlpha);
+            accColor += color.rgb * shade * a;
+            accAlpha += a;
+
+            finalNormal = -rayStep * ivec3(mask);
+            brickMaterial = materials[occupancy];
+        }
+
+        mask     = lessThanEqual(sideDist.xyz, min(sideDist.yzx, sideDist.zxy));
+        sideDist += vec3(mask) * deltaDist;
+        mapPos   += (ivec3(vec3(mask)) * rayStep)*8;
+    }
+
+
+    if (accAlpha > 0.004) {
+        outLocalT = firstT; 
+        brickNormals = finalNormal;
+        material = brickMaterial;
+        return true;
+    }
+    return false;
+}
+
+
+Material traceAllObjects(vec3 worldRo, vec3 worldRd, out bool anyHit, out vec3 pos, out vec3 normal) {
+    anyHit = false;
+
+    float bestWorldT  = 1e30;
+    vec3  bestColor   = vec3(0.0);
+
+    int objCount = int(camera.objectCount);
+
+    Material bestMaterial;
+    for (int objIdx = 0; objIdx < objCount; objIdx++) {
+        VoxelObject obj = objects[objIdx];
+
+
+        vec3 localRo = (obj.invTransform * vec4(worldRo, 1.0)).xyz;
+        vec3 localRd = (obj.invTransform * vec4(worldRd, 0.0)).xyz;
+
+        float localRdLen = length(localRd);
+        vec3 localRdNorm = localRd / localRdLen;
+
+        ivec3 gridSz = obj.gridSizeAndTex.xyz;
+        int   texIdx = obj.gridSizeAndTex.w;
+
+        vec3  hitColor;
+        float localT;
+        ivec3 normalMask;
+        Material material;
+
+        float disFromCamera = distance(camera.cameraPos, worldRo);
+        if (!traceBrick_Local(localRo, localRdNorm, texIdx, gridSz, disFromCamera, material, localT, normalMask))
+            continue;
+
+        float correctedLocalT = localT / localRdLen;
+
+        vec3 localHitPoint = localRo + localRdNorm * localT;
+        vec3 worldHitPoint = (obj.transform * vec4(localHitPoint, 1.0)).xyz;
+        float worldT       = length(worldHitPoint - worldRo);
+
+        
+        if (worldT < bestWorldT) {
+            pos = worldHitPoint;
+            bestWorldT = worldT;
+            bestMaterial  = material;
+            anyHit     = true;
+            normal = normalMask;
+        }
+    }
+
+    return bestMaterial;
+}
+
+vec3 getSky(vec3 rayDir, vec3 sunDir) {
+
+    vec3 dir = normalize(rayDir);
+
+    float sunDot = dot(dir, sunDir);
+
+
+    //sun size
+    float sunThreshold = 0.998; 
+
+    vec3 skyColor = vec3(0.63, 0.79, 0.90); 
+    vec3 sunColor = vec3(1.0, 1.0, 0.0);   
+
+    //Mie mask
+    float sun = max(1.0 - (1.0 + 10.0 * sunDir.y + 1.0 * rayDir.y) * length(rayDir - sunDir),0.0)
+        + 0.3 * pow(1.0-rayDir.y,12.0) * (1.6-sunDir.y);
+
+
+    vec4 color = vec4(mix(vec3(0.3984,0.5117,0.7305), vec3(0.7031,0.4687,0.1055), sun)
+              * ((0.5 + 1.0 * pow(sunDir.y,0.4)) * (1.5-rayDir.y) + pow(sun, 5.2)
+              * sunDir.y * (5.0 + 15.0 * sunDir.y)),1.0);
+
+    
+    if(rayDir.y < 0)
+        color = vec4(0, 157, 196, 255)/256;
+
+    return color.xyz;
+}
+
+
+// --- RNG Stuff ---
+
+// SebLagues raycasting randomization code
+
+// PCG (permuted congruential generator). Thanks to:
+// www.pcg-random.org and www.shadertoy.com/view/XlGcRh
+
+uint randomState;
+
+uint pcg_hash(uint inp)
+{
+    uint state = inp * 747796405u + 2891336453u;
+    uint word = ((state >> ((state >> 28u) + 4u)) ^ state) * 277803737u;
+    return (word >> 22u) ^ word;
+}
+float RandomValue()
+{
+    randomState = pcg_hash(randomState);
+	return randomState * (1.0 /4294967296.0); // 2^32 - 1
+}
+
+// Random value in normal distribution (with mean=0 and sd=1)
+float RandomValueNormalDistribution(inout uint state)
+{
+	// Thanks to https://stackoverflow.com/a/6178290
+	float theta = 2 * 3.1415926 * RandomValue();
+	float rho = sqrt(-2 * log(RandomValue()));
+	return rho * cos(theta);
+}
+
+// Calculate a random direction
+vec3 RandomDirection(inout uint state)
+{
+	// Thanks to https://math.stackexchange.com/a/1585996
+	float x = RandomValueNormalDistribution(state);
+	float y = RandomValueNormalDistribution(state);
+	float z = RandomValueNormalDistribution(state);
+	return normalize(vec3(x, y, z));
+}
+
+vec3 randomHemisphereDirection(vec3 normal, inout uint rngState)
+{
+    vec3 randDir = RandomDirection(rngState);
+    return randDir * sign(dot(normal, randDir));
+
+}
+
+
+vec3 generateLightValue(int maxSamples, vec3 hitPos, vec3 normal, vec3 sunDir)
+{
+    bool hitDummy;
+    vec3 hitPosDummy;
+    vec3 normalDummmy;
+
+    vec3 averageColor = vec3(0);
+
+    for(int i =0; i< maxSamples; i++)
+    {
+
+        vec3 ranDir = randomHemisphereDirection(normal, randomState);
+        Material material = traceAllObjects(hitPos, ranDir, hitDummy, hitPosDummy, normalDummmy);
+
+        vec3 color;
+        if(hitDummy) color = material.color.xyz;
+        else color = getSky(ranDir, sunDir);
+
+        averageColor = averageColor + color;
+    }
+
+    return averageColor/maxSamples;
+
+}
+
+
+bool iFloor(in vec3 ro, in vec3 rd, out float t)
+{
+    float floor_y = -1.5;
+    t = (floor_y - ro.y) / rd.y;
+    return t > 0.0;
+}
+// -------------------------------------------------------2
+// Main
+// -------------------------------------------------------
+void main() {
+    ivec2 fragCoord = ivec2(gl_GlobalInvocationID.xy) * RESOLUTION_SCALE;
+    ivec2 size      = imageSize(img);
+
+
+    if (fragCoord.x >= size.x || fragCoord.y >= size.y) return;
+
+    vec2 uv = (vec2(fragCoord) / vec2(size)) * 2.0 - 1.0;
+    vec4 p0 = camera.view * vec4(uv, 0.0, 1.0);
+    vec4 p1 = camera.view * vec4(uv, 1.0, 1.0);
+    p0.xyz /= p0.w;
+    p1.xyz /= p1.w;
+    const float EPSILON = 1e-5;
+    vec3 rayDir = normalize(p1.xyz - camera.cameraPos );
+    vec3 rayPos = camera.cameraPos;
+     
+
+
+    bool  hit;
+    vec3 hitPos;
+    vec3 normal1;
+    Material material1 = traceAllObjects(rayPos, rayDir, hit, hitPos, normal1);
+
+    vec3 norm1 = (-1 * (sign(rayDir))) * normal1;
+
+    vec3 color = material1.color.xyz;
+    float sunSpeed = 0.005;
+    vec3 sunDir = normalize(vec3(0.1*cos(camera.time*sunSpeed), 0.1*sin(camera.time*sunSpeed), 0.1)); 
+
+    // Sky color if nothing was hit
+
+    randomState = uint(fragCoord.x)
+    + uint(fragCoord.y) * uint(size.x)
+    + uint(camera.voxelCount) * 1664525u;
+
+
+ 
+
+
+    bool unlit;
+    vec3 hitPos2;
+    vec3 normal2;
+    Material material2 = traceAllObjects(hitPos+ vec3(0.01), sunDir, unlit, hitPos2, normal2);
+    
+
+
+
+
+
+    //vec3 secondaryColor =generateLightValue(1, hitPos, norm1, sunDir);
+
+
+    float directLightValue = 1;
+
+    if(unlit == true) directLightValue =  0.75;
+
+
+
+
+    
+
+
+    //vec3 direct = material1.color.xyz * directLightValue * max(dot(norm1, sunDir),0); 
+   // vec3 indirect = secondaryColor ; 
+
+   // vec3 lightingColor = direct +indirect ; 
+    if(unlit == true) color = color *0.5;
+    
+
+
+    
+
+
+    color =material1.color.xyz * directLightValue;
+
+    if(normal1.x== 1)  color = color *0.95;
+    if(normal1.y== 1) color =  color *0.90;
+    if(normal1.z== 1) color =  color *0.85;
+    if (!hit) color = getSky(rayDir, sunDir);
+
+    if (FLOORENABLED && !hit)
+    {
+        float t = -rayPos.y /rayDir.y;
+
+        vec3 p = rayPos + t * rayDir;
+
+        float cellSize = 50;
+
+        vec3 colorA = vec3(0.94f);
+        vec3 colorB = vec3(0.6f, 0.7f, 1.0f);
+        vec2 cell = floor(p.xz/cellSize);
+        if (t>=0.0f)
+        {
+            float checker = mod((cell.x + cell.y), 2.0);
+            color = mix(colorA, colorB, checker);
+        }
+
+    
+    }
+
+    vec4 finalColor = vec4(color, 1.0);
+
+
+    for (int dx = 0; dx < RESOLUTION_SCALE; dx++) {
+        for (int dy = 0; dy < RESOLUTION_SCALE; dy++) {
+            ivec2 outCoord = fragCoord + ivec2(dx, dy);
+            if (outCoord.x < size.x && outCoord.y < size.y)
+                imageStore(img, outCoord, finalColor);
+        }
+    }
+}
