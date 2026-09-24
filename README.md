@@ -1,4 +1,4 @@
-Cube
+# Cube Engine
 
 ![Logo](Cube/Images/CubeLogo.png)
 
@@ -14,7 +14,7 @@ Visual Studio 2022 is recommended
 
     //no build yet
 
-Current Main Features:
+# Current Main Features:
 
     Ui(using imgui library)
     Voxel physics solver and collider system(using Bullet-Physics library)
@@ -27,7 +27,7 @@ Current Main Features:
     Voxel alteration and destruction
 
 
-Future goals for this project:
+# Future goals for this project:
 
 Note: this may change in the Future.
 
@@ -41,3 +41,4 @@ by sometime 2027, i plan to have made a full micro voxel game using this game en
     Global illumination
 
 
+![Logo](Cube/Images/sponzaScreenShot.png)
