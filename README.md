@@ -48,6 +48,6 @@ The Engine is created in C++ and uses the Vulkan graphics api; each voxel is rep
 
 Usefull resources:
 
-![NVIDIA Research Paper]([Cube/Images/CubeLogo.png](https://research.nvidia.com/sites/default/files/pubs/2010-02_Efficient-Sparse-Voxel/laine2010i3d_paper.pdf))
+![NVIDIA Research Paper](https://research.nvidia.com/sites/default/files/pubs/2010-02_Efficient-Sparse-Voxel/laine2010tr1_paper.pdf)
 
 ![Douglas' Voxel Engine](https://github.com/DouglasDwyer/voxel_engine)
