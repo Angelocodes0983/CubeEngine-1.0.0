@@ -1,6 +1,6 @@
 Cube
 
-![Logo](Cube/images/CubeLogo.png)
+![Logo](Cube/Images/CubeLogo.png)
 
 The cube Engine is a Voxel game engine that renders voxels directly to the screen rather than tradition traingle rasterization
 
