@@ -1,4 +1,4 @@
-# Cube Engine
+# Cube Engine V1.0.0
 
 ![Logo](Cube/Images/CubeLogo.png)
 
@@ -42,3 +42,12 @@ by sometime 2027, i plan to have made a full micro voxel game using this game en
 
 # In engine graphics test screenshot:
 ![Logo](Cube/Images/sponzaScreenShot.png)
+
+# Technical Renderer Explanation
+The Engine is created in C++ and uses the Vulkan graphics api; each voxel is represented by 8 bytes, allowing each voxel object to have a 255-color palette. Each brick is a data representation of an 8x8x8 area of voxels and only stores one occupancy integer, which lets the renderer determine if the region is full, empty, or mixed. Then a compute takes in the brick and voxel info about each object and uses the DDA traversal algorithm to step through each brick; then, if necessary, the DDA ray will start traversal on the voxel level. This traversal then returns a pixel color after completing traversal(a ray is initialized from every pixel on the screen). After the pixel color is returned, a secondary ray is cast from the ray hit position to the sun to create hard shadows. 
+
+Usefull resources:
+
+![NVIDIA Research Paper]([Cube/Images/CubeLogo.png](https://research.nvidia.com/sites/default/files/pubs/2010-02_Efficient-Sparse-Voxel/laine2010i3d_paper.pdf))
+
+![Douglas' Voxel Engine](https://github.com/DouglasDwyer/voxel_engine)
