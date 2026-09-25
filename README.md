@@ -2,7 +2,7 @@
 
 ![Logo](Cube/Images/CubeLogo.png)
 
-The cube Engine is a Voxel game engine that renders voxels directly to the screen rather than tradition traingle rasterization
+The Cube engine is a voxel game engine that renders voxels directly to the screen rather than using traditional triangle rasterization
 
 Visual Studio 2022 is recommended
 
@@ -31,7 +31,8 @@ Visual Studio 2022 is recommended
 
 Note: this may change in the Future.
 
-by sometime 2027, i plan to have made a full micro voxel game using this game engine. However this means that there are still many more tools and features that must be added, features including:
+By sometime in 2027, I plan to have made a full micro voxel game using this game engine. However, this means that there are still many more tools and features that must be added, including:
+
 
     Built in lod
     memory optimizations 
@@ -41,6 +42,7 @@ by sometime 2027, i plan to have made a full micro voxel game using this game en
     Global illumination
 
 # In engine graphics test screenshot:
+512x512x512 voxel scene
 ![Logo](Cube/Images/sponzaScreenShot.png)
 
 # Technical Renderer Explanation
